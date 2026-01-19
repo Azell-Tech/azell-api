@@ -1,3 +1,4 @@
+// api/index.js (Express + MySQL) — JavaScript puro (sin TS)
 import express from "express";
 import mysql from "mysql2/promise";
 import cors from "cors";
@@ -51,10 +52,8 @@ async function sendWithdrawEmail({ to, from, subject, html, text }) {
   return { sent: true };
 }
 
-function nowBogotaISO() {
-  // Railway corre en UTC; dejamos ISO y también un string legible.
-  const d = new Date();
-  return d.toISOString();
+function nowISO() {
+  return new Date().toISOString();
 }
 
 function formatMoneyMXN(n) {
@@ -69,6 +68,17 @@ function formatMoneyMXN(n) {
   }
 }
 
+function mustInt(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
+}
+
+function mustAmount(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n * 100) / 100;
+}
+
 // --- Health ---
 app.get("/health", (_, res) => {
   res.json({ ok: true });
@@ -76,25 +86,29 @@ app.get("/health", (_, res) => {
 
 // --- Login ---
 app.post("/login", async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password } = req.body || {};
+
+  if (!email || !password) {
+    return res.status(400).json({ message: "email y password son requeridos" });
+  }
 
   const [rows] = await pool.query(
     "SELECT id, email, name FROM users WHERE email=? AND password=? LIMIT 1",
     [email, password]
   );
 
-  if (!rows.length) {
+  if (!rows || !rows.length) {
     return res.status(401).json({ message: "Credenciales inválidas" });
   }
 
   res.json({ user: rows[0] });
 });
 
-// --- Productos del usuario (dashboard) ---
+// --- Dashboard ---
 app.get("/dashboard/:userId", async (req, res) => {
-  const { userId } = req.params;
+  const userId = mustInt(req.params.userId);
+  if (!userId) return res.status(400).json({ message: "userId inválido" });
 
-  // saldo real = sum(transactions.amount)
   const [[bal]] = await pool.query(
     `
     SELECT COALESCE(SUM(amount),0) AS balance
@@ -139,7 +153,6 @@ app.get("/dashboard/:userId", async (req, res) => {
     [userId]
   );
 
-  // rendimiento estimado: suma de yields en proceso + aplicado
   const [[y]] = await pool.query(
     `
     SELECT COALESCE(SUM(amount),0) AS totalYield
@@ -151,126 +164,184 @@ app.get("/dashboard/:userId", async (req, res) => {
 
   res.json({
     summary: {
-      balance: Number(bal?.balance || 0),
-      totalYield: Number(y?.totalYield || 0),
+      balance: Number((bal && bal.balance) || 0),
+      totalYield: Number((y && y.totalYield) || 0),
     },
-    products,
-    transactions: txns,
+    products: Array.isArray(products) ? products : [],
+    transactions: Array.isArray(txns) ? txns : [],
   });
 });
 
-// --- Catálogo (para oportunidades) ---
+// --- Products catalog (opportunities) ---
 app.get("/products", async (req, res) => {
-  const status = req.query.status;
+  const status = String(req.query.status || "").trim();
+
   if (status) {
-    const [rows] = await pool.query("SELECT * FROM products WHERE status=?", [
-      status,
-    ]);
-    return res.json(rows);
+    const [rows] = await pool.query(
+      "SELECT * FROM products WHERE status=? ORDER BY id ASC",
+      [status]
+    );
+    return res.json(Array.isArray(rows) ? rows : []);
   }
-  const [rows] = await pool.query("SELECT * FROM products");
-  res.json(rows);
+
+  const [rows] = await pool.query("SELECT * FROM products ORDER BY id ASC");
+  res.json(Array.isArray(rows) ? rows : []);
 });
 
-// --- Retiro + notificación por email ---
+// --- Withdraw: request + txn negative (affects balance) + mail optional ---
 app.post("/withdraw", async (req, res) => {
-  const { userId, productId, amount } = req.body;
+  const userId = mustInt(req.body && req.body.userId);
+  const productId = mustInt(req.body && req.body.productId);
+  const amount = mustAmount(req.body && req.body.amount);
 
-  if (!userId || !amount) {
-    return res.status(400).json({ message: "userId y amount son requeridos" });
+  if (!userId || !productId || !amount) {
+    return res.status(400).json({
+      message: "userId, productId y amount son requeridos",
+    });
   }
 
-  // guardar retiro
-  const [r1] = await pool.query(
-    "INSERT INTO withdrawals (user_id, amount) VALUES (?, ?)",
-    [userId, amount]
-  );
+  const conn = await pool.getConnection();
 
-  // registrar transacción (opcional, recomendado para saldo)
-  // si quieres que el saldo baje al instante, registra la salida como "withdrawal" negativa
-  await pool.query(
-    `
-    INSERT INTO transactions (user_id, product_id, type, description, reference, status, amount, txn_date)
-    VALUES (?, ?, 'withdrawal', 'Solicitud de retiro', ?, 'En proceso', ?, NOW())
-    `,
-    [
-      userId,
-      productId || null,
-      `WDR-${String(r1.insertId).padStart(6, "0")}`,
-      -Math.abs(Number(amount)),
-    ]
-  );
+  try {
+    await conn.beginTransaction();
 
-  // datos para email (cliente + producto)
-  const [[u]] = await pool.query(
-    "SELECT id, email, name FROM users WHERE id=? LIMIT 1",
-    [userId]
-  );
+    // validar inversión del producto del usuario
+    const [[up]] = await conn.query(
+      `
+      SELECT invested_amount
+      FROM user_products
+      WHERE user_id=? AND product_id=?
+      LIMIT 1
+      `,
+      [userId, productId]
+    );
 
-  let product = null;
-  if (productId) {
+    if (!up) {
+      await conn.rollback();
+      return res.status(404).json({ message: "Producto no asignado al usuario" });
+    }
+
+    const invested = Number(up.invested_amount || 0);
+    if (!Number.isFinite(invested) || invested <= 0) {
+      await conn.rollback();
+      return res
+        .status(400)
+        .json({ message: "El producto no tiene inversión registrada" });
+    }
+
+    if (amount > invested) {
+      await conn.rollback();
+      return res.status(400).json({
+        message: `El monto debe ser menor o igual a lo invertido (${formatMoneyMXN(
+          invested
+        )})`,
+      });
+    }
+
+    // crear solicitud en withdrawal_requests
+    const [rReq] = await conn.query(
+      `
+      INSERT INTO withdrawal_requests (user_id, product_id, amount, status, requested_at)
+      VALUES (?, ?, ?, 'En proceso', NOW())
+      `,
+      [userId, productId, amount]
+    );
+
+    const withdrawalId = rReq.insertId;
+    const reference = `WDR-${String(withdrawalId).padStart(6, "0")}`;
+
+    // registrar transacción negativa
+    await conn.query(
+      `
+      INSERT INTO transactions (user_id, product_id, type, description, reference, status, amount, txn_date)
+      VALUES (?, ?, 'withdrawal', 'Solicitud de retiro', ?, 'En proceso', ?, NOW())
+      `,
+      [userId, productId, reference, -Math.abs(amount)]
+    );
+
+    await conn.commit();
+
+    // email (mejor fuera de transacción)
+    const [[u]] = await pool.query(
+      "SELECT id, email, name FROM users WHERE id=? LIMIT 1",
+      [userId]
+    );
+
     const [[p]] = await pool.query(
       "SELECT id, name FROM products WHERE id=? LIMIT 1",
       [productId]
     );
-    product = p || null;
-  }
 
-  const iso = nowBogotaISO();
-  const subject = `Azell | Retiro solicitado | ${u?.name || "Cliente"}`;
-  const prettyAmount = formatMoneyMXN(amount);
+    const iso = nowISO();
+    const subject = `Azell | Retiro solicitado | ${(u && u.name) || "Cliente"}`;
+    const prettyAmount = formatMoneyMXN(amount);
 
-  const text =
-    `Solicitud de retiro\n\n` +
-    `Cliente: ${u?.name || "-"} (${u?.email || "-"})\n` +
-    `Producto: ${product?.name || "No especificado"}\n` +
-    `Valor: ${prettyAmount}\n` +
-    `Fecha/hora (ISO): ${iso}\n` +
-    `ID retiro: ${r1.insertId}\n`;
+    const text =
+      `Solicitud de retiro\n\n` +
+      `Cliente: ${(u && u.name) || "-"} (${(u && u.email) || "-"})\n` +
+      `Producto: ${(p && p.name) || "-"}\n` +
+      `Valor: ${prettyAmount}\n` +
+      `Fecha/hora (ISO): ${iso}\n` +
+      `ID solicitud: ${withdrawalId}\n` +
+      `Referencia: ${reference}\n`;
 
-  const html = `
-    <div style="font-family: Arial, sans-serif; line-height:1.4">
-      <h2>Solicitud de retiro</h2>
-      <p><b>Cliente:</b> ${u?.name || "-"}<br/>
-         <b>Correo:</b> ${u?.email || "-"}<br/>
-         <b>Producto:</b> ${product?.name || "No especificado"}<br/>
-         <b>Valor:</b> ${prettyAmount}<br/>
-         <b>Fecha/hora (ISO):</b> ${iso}<br/>
-         <b>ID retiro:</b> ${r1.insertId}
-      </p>
-    </div>
-  `;
+    const html = `
+      <div style="font-family: Arial, sans-serif; line-height:1.45">
+        <h2>Solicitud de retiro</h2>
+        <p>
+          <b>Cliente:</b> ${(u && u.name) || "-"}<br/>
+          <b>Correo:</b> ${(u && u.email) || "-"}<br/>
+          <b>Producto:</b> ${(p && p.name) || "-"}<br/>
+          <b>Valor:</b> ${prettyAmount}<br/>
+          <b>Fecha/hora (ISO):</b> ${iso}<br/>
+          <b>ID solicitud:</b> ${withdrawalId}<br/>
+          <b>Referencia:</b> ${reference}
+        </p>
+      </div>
+    `;
 
-  try {
-    const mailRes = await sendWithdrawEmail({
-      to: process.env.WITHDRAW_NOTIFY_TO,
-      from: process.env.WITHDRAW_NOTIFY_FROM || process.env.SMTP_USER,
-      subject,
-      html,
-      text,
-    });
-
-    // log interno
-    console.log("WITHDRAW:", { userId, productId, amount, mailRes });
+    let notified = false;
+    try {
+      const mailRes = await sendWithdrawEmail({
+        to: process.env.WITHDRAW_NOTIFY_TO,
+        from: process.env.WITHDRAW_NOTIFY_FROM || process.env.SMTP_USER,
+        subject,
+        html,
+        text,
+      });
+      notified = !!mailRes.sent;
+      console.log("WITHDRAW:", {
+        userId,
+        productId,
+        amount,
+        withdrawalId,
+        reference,
+        notified,
+        mailRes,
+      });
+    } catch (e) {
+      console.error("EMAIL_ERROR:", e && e.message ? e.message : e);
+    }
 
     return res.json({
-      status: "Pendiente",
-      withdrawalId: r1.insertId,
-      notified: !!mailRes.sent,
+      status: "En proceso",
+      withdrawalId,
+      reference,
+      notified,
     });
   } catch (e) {
-    console.error("EMAIL_ERROR:", e?.message || e);
-    // no rompemos la UX del cliente: retiro queda creado igual
-    return res.json({
-      status: "Pendiente",
-      withdrawalId: r1.insertId,
-      notified: false,
-    });
+    try {
+      await conn.rollback();
+    } catch {}
+    console.error("WITHDRAW_ERROR:", e && e.message ? e.message : e);
+    return res.status(500).json({ message: "Error procesando retiro" });
+  } finally {
+    conn.release();
   }
 });
 
 // --- Start ---
-const port = process.env.PORT || 3000;
+const port = Number(process.env.PORT || 3000);
 app.listen(port, () => {
   console.log("Azell API running on port", port);
 });
